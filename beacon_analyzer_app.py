@@ -144,6 +144,35 @@ def create_interactive_plot(df, beacon, time_window):
     
     return fig
 
+def get_beacon_data_quality(db_path, beacons, start_datetime_str, end_datetime_str):
+    """Analyze beacon data quality for smart selection"""
+    try:
+        conn = sqlite3.connect(db_path)
+        
+        # Get data counts and quality metrics for all beacons
+        query = """
+        SELECT 
+            beacon.Description as BeaconDescription,
+            COUNT(*) as DataPoints,
+            AVG(event.ExternalSensorTemperature) as AvgTemp,
+            MIN(event.ExternalSensorTemperature) as MinTemp,
+            MAX(event.ExternalSensorTemperature) as MaxTemp,
+            AVG(event.RSSI) as AvgRSSI,
+            COUNT(CASE WHEN event.ExternalSensorTemperature IS NULL THEN 1 END) as NullTemps
+        FROM BeaconEvent event
+        INNER JOIN Beacon beacon ON event.BeaconId = beacon.Id
+        WHERE event.DateTime BETWEEN ? AND ?
+        GROUP BY beacon.Description
+        ORDER BY DataPoints DESC
+        """
+        
+        df = pd.read_sql_query(query, conn, params=[start_datetime_str, end_datetime_str])
+        conn.close()
+        
+        return df
+    except Exception as e:
+        return None
+
 def create_beacon_temperature_schematic(df, startup_datetime_str, cutoff_datetime_str, target_temp=115):
     """Create a 3x11 grid schematic showing beacon temperatures with color coding"""
     startup_datetime = datetime.strptime(startup_datetime_str, '%Y-%m-%d %H:%M:%S')
@@ -244,13 +273,161 @@ def main():
             # Sidebar controls
             st.sidebar.header("🎛️ Controls")
             
-            # Beacon selection
-            selected_beacons = st.sidebar.multiselect(
-                "Select Beacon(s)",
-                options=beacons,
-                default=beacons[:3] if len(beacons) >= 3 else beacons,
-                help="Choose one or more beacons to analyze"
+            # Enhanced beacon selection
+            st.sidebar.subheader("🎯 Beacon Selection")
+            
+            # Quick selection buttons
+            col1, col2, col3 = st.sidebar.columns(3)
+            with col1:
+                if st.button("Select All", help="Select all beacons"):
+                    st.session_state.selected_beacons = beacons.copy()
+            with col2:
+                if st.button("Clear All", help="Deselect all beacons"):
+                    st.session_state.selected_beacons = []
+            with col3:
+                if st.button("First 10", help="Select first 10 beacons"):
+                    st.session_state.selected_beacons = beacons[:10]
+            
+            # Smart selection button
+            smart_col1, smart_col2 = st.sidebar.columns(2)
+            with smart_col1:
+                if st.button("🧠 Smart Select", help="Select beacons with best data quality"):
+                    # Get data quality info
+                    quality_df = get_beacon_data_quality(
+                        db_path, 
+                        beacons, 
+                        start_datetime.strftime('%Y-%m-%d %H:%M:%S'),
+                        end_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                    )
+                    if quality_df is not None and not quality_df.empty:
+                        # Select top 10 beacons by data points and low null count
+                        quality_df['Quality_Score'] = quality_df['DataPoints'] - (quality_df['NullTemps'] * 10)
+                        top_beacons = quality_df.nlargest(10, 'Quality_Score')['BeaconDescription'].tolist()
+                        st.session_state.selected_beacons = top_beacons
+                    else:
+                        st.session_state.selected_beacons = beacons[:10]
+            with smart_col2:
+                if st.button("🎯 Good Temp", help="Select beacons with good temperature data"):
+                    quality_df = get_beacon_data_quality(
+                        db_path, 
+                        beacons, 
+                        start_datetime.strftime('%Y-%m-%d %H:%M:%S'),
+                        end_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                    )
+                    if quality_df is not None and not quality_df.empty:
+                        # Select beacons with temperature in reasonable range and good data
+                        good_temp = quality_df[
+                            (quality_df['AvgTemp'] >= 50) & 
+                            (quality_df['AvgTemp'] <= 150) & 
+                            (quality_df['DataPoints'] >= 10)
+                        ]['BeaconDescription'].tolist()
+                        st.session_state.selected_beacons = good_temp[:15] if good_temp else beacons[:10]
+                    else:
+                        st.session_state.selected_beacons = beacons[:10]
+            
+            # Initialize session state for selected beacons
+            if 'selected_beacons' not in st.session_state:
+                st.session_state.selected_beacons = beacons[:3] if len(beacons) >= 3 else beacons.copy()
+            
+            # Beacon selection with search and range selection
+            search_term = st.sidebar.text_input(
+                "🔍 Search Beacons", 
+                placeholder="Type to filter beacons...",
+                help="Filter beacon list by name"
             )
+            
+            # Filter beacons based on search
+            filtered_beacons = [b for b in beacons if search_term.lower() in b.lower()] if search_term else beacons
+            
+            # Range selection
+            if len(filtered_beacons) > 1:
+                st.sidebar.write("**Range Selection:**")
+                range_col1, range_col2 = st.sidebar.columns(2)
+                with range_col1:
+                    start_idx = st.selectbox(
+                        "From:", 
+                        options=range(len(filtered_beacons)),
+                        format_func=lambda x: f"{x+1}. {filtered_beacons[x]}",
+                        key="start_range"
+                    )
+                with range_col2:
+                    end_idx = st.selectbox(
+                        "To:", 
+                        options=range(len(filtered_beacons)),
+                        index=min(9, len(filtered_beacons)-1),
+                        format_func=lambda x: f"{x+1}. {filtered_beacons[x]}",
+                        key="end_range"
+                    )
+                
+                if st.sidebar.button("Select Range", help="Select beacons from start to end index"):
+                    start = min(start_idx, end_idx)
+                    end = max(start_idx, end_idx)
+                    range_beacons = filtered_beacons[start:end+1]
+                    # Add to existing selection (union)
+                    st.session_state.selected_beacons = list(set(st.session_state.selected_beacons + range_beacons))
+            
+            # Main multiselect with current selection
+            selected_beacons = st.sidebar.multiselect(
+                "Selected Beacon(s)",
+                options=beacons,
+                default=st.session_state.selected_beacons,
+                help="Choose one or more beacons to analyze. Use buttons above for quick selection.",
+                key="beacon_multiselect"
+            )
+            
+            # Update session state
+            st.session_state.selected_beacons = selected_beacons
+            
+            # Show selection summary
+            if selected_beacons:
+                st.sidebar.success(f"✅ {len(selected_beacons)} beacon(s) selected")
+                
+                # Advanced selection options
+                with st.sidebar.expander("🔧 Advanced Selection"):
+                    # Pattern-based selection
+                    pattern = st.text_input(
+                        "Select by pattern", 
+                        placeholder="e.g., Beacon_0, _01, etc.",
+                        help="Select beacons matching a pattern"
+                    )
+                    if pattern and st.button("Apply Pattern"):
+                        pattern_matches = [b for b in beacons if pattern.lower() in b.lower()]
+                        st.session_state.selected_beacons = list(set(st.session_state.selected_beacons + pattern_matches))
+                        st.rerun()
+                    
+                    # Temperature-based selection (if we have previous data)
+                    st.write("**Quick Select by Temperature Range:**")
+                    temp_col1, temp_col2 = st.columns(2)
+                    with temp_col1:
+                        min_temp = st.number_input("Min °C", value=100, step=5)
+                    with temp_col2:
+                        max_temp = st.number_input("Max °C", value=130, step=5)
+                    
+                    if st.button("Select by Temp Range"):
+                        st.info("💡 This will work after first data analysis")
+            else:
+                st.sidebar.warning("⚠️ No beacons selected")
+            
+            # Checkbox grid for visual selection (for smaller beacon lists)
+            if len(beacons) <= 20:
+                with st.sidebar.expander("📋 Visual Selection Grid"):
+                    st.write("Check/uncheck individual beacons:")
+                    
+                    # Create checkbox grid (4 columns)
+                    cols = st.columns(2)
+                    for i, beacon in enumerate(beacons):
+                        with cols[i % 2]:
+                            is_selected = beacon in selected_beacons
+                            if st.checkbox(
+                                beacon, 
+                                value=is_selected, 
+                                key=f"checkbox_{beacon}_{i}"
+                            ):
+                                if beacon not in st.session_state.selected_beacons:
+                                    st.session_state.selected_beacons.append(beacon)
+                            else:
+                                if beacon in st.session_state.selected_beacons:
+                                    st.session_state.selected_beacons.remove(beacon)
             
             # Date range selection
             col1, col2 = st.sidebar.columns(2)
@@ -276,6 +453,10 @@ def main():
             with col4:
                 end_time = st.time_input("End Time", value=datetime.strptime("18:00", "%H:%M").time())
             
+            # Combine date and time early for use in smart selection
+            start_datetime = datetime.combine(start_date, start_time)
+            end_datetime = datetime.combine(end_date, end_time)
+            
             # Time window selection
             time_window = st.sidebar.selectbox(
                 "Time Window for Resampling",
@@ -295,10 +476,6 @@ def main():
                     value=115,
                     help="Reference temperature for color coding"
                 )
-            
-            # Combine date and time
-            start_datetime = datetime.combine(start_date, start_time)
-            end_datetime = datetime.combine(end_date, end_time)
             
             # Analysis button
             if st.sidebar.button("🔍 Analyze Data", type="primary"):

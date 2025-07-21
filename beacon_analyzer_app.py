@@ -3,6 +3,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
@@ -143,6 +144,70 @@ def create_interactive_plot(df, beacon, time_window):
     
     return fig
 
+def create_beacon_temperature_schematic(df, startup_datetime_str, cutoff_datetime_str, target_temp=115):
+    """Create a 3x11 grid schematic showing beacon temperatures with color coding"""
+    startup_datetime = datetime.strptime(startup_datetime_str, '%Y-%m-%d %H:%M:%S')
+    cutoff_datetime = datetime.strptime(cutoff_datetime_str, '%Y-%m-%d %H:%M:%S')
+    filtered_df = df[(df['DateTime'] >= startup_datetime) & (df['DateTime'] <= cutoff_datetime)]
+    
+    if filtered_df.empty:
+        return None, "No data found for the specified time range."
+    
+    # Get maximum temperature for each beacon instead of last
+    max_temps = filtered_df.groupby('BeaconDescription')['ExternalSensorTemperature'].max().round(1)
+    beacons = sorted(max_temps.index.tolist())
+    
+    # Create 3x11 grid
+    fig, axes = plt.subplots(3, 11, figsize=(16, 8))
+    fig.suptitle(f'Beacon Temperature Schematic (Max vs Target {target_temp}°C)', fontsize=16)
+    
+    for i in range(3):
+        for j in range(11):
+            ax = axes[i, j]
+            beacon_idx = i * 11 + j
+            
+            if beacon_idx < len(beacons):
+                beacon = beacons[beacon_idx]
+                max_temp = max_temps[beacon]
+                
+                # Color coding: green if close to target, red if far
+                temp_diff = abs(max_temp - target_temp)
+                if temp_diff <= 5:
+                    color = 'lightgreen'
+                elif temp_diff <= 15:
+                    color = 'yellow'
+                else:
+                    color = 'lightcoral'
+                
+                # Create colored rectangle
+                rect = patches.Rectangle((0, 0), 1, 1, linewidth=2, edgecolor='black', facecolor=color)
+                ax.add_patch(rect)
+                
+                # Add text
+                ax.text(0.5, 0.7, beacon, ha='center', va='center', fontweight='bold', fontsize=8)
+                ax.text(0.5, 0.4, f'{max_temp}°C', ha='center', va='center', fontsize=10)
+                
+            else:
+                # Empty cell
+                ax.add_patch(patches.Rectangle((0, 0), 1, 1, linewidth=1, edgecolor='gray', facecolor='white'))
+                ax.text(0.5, 0.5, 'Empty', ha='center', va='center', fontsize=8, color='gray')
+            
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_xticks([])
+            ax.set_yticks([])
+    
+    # Add legend
+    legend_elements = [
+        patches.Patch(color='lightgreen', label=f'Within ±5°C of {target_temp}°C'),
+        patches.Patch(color='yellow', label=f'Within ±15°C of {target_temp}°C'),
+        patches.Patch(color='lightcoral', label=f'More than ±15°C from {target_temp}°C')
+    ]
+    fig.legend(handles=legend_elements, loc='lower center', ncol=3, bbox_to_anchor=(0.5, -0.05))
+    
+    plt.tight_layout()
+    return fig, None
+
 # Main Streamlit app
 def main():
     st.title("📡 Beacon Data Analyzer")
@@ -218,6 +283,19 @@ def main():
                 index=1
             )
             
+            # Beacon schematic options
+            st.sidebar.subheader("🌡️ Beacon Temperature Schematic")
+            show_schematic = st.sidebar.checkbox("Show Temperature Schematic", value=False)
+            
+            if show_schematic:
+                target_temp = st.sidebar.number_input(
+                    "Target Temperature (°C)",
+                    min_value=50,
+                    max_value=150,
+                    value=115,
+                    help="Reference temperature for color coding"
+                )
+            
             # Combine date and time
             start_datetime = datetime.combine(start_date, start_time)
             end_datetime = datetime.combine(end_date, end_time)
@@ -243,6 +321,54 @@ def main():
                 
                 # Display summary
                 st.success(f"✅ Found {len(df)} data points for {len(selected_beacons)} beacon(s)")
+                
+                # Show beacon temperature schematic if enabled
+                if show_schematic:
+                    st.header("🌡️ Beacon Temperature Schematic")
+                    
+                    with st.spinner("Creating temperature schematic..."):
+                        schematic_fig, error_msg = create_beacon_temperature_schematic(
+                            df, 
+                            start_datetime.strftime('%Y-%m-%d %H:%M:%S'),
+                            end_datetime.strftime('%Y-%m-%d %H:%M:%S'),
+                            target_temp
+                        )
+                    
+                    if error_msg:
+                        st.error(error_msg)
+                    elif schematic_fig:
+                        st.pyplot(schematic_fig)
+                        
+                        # Show beacon statistics summary
+                        st.subheader("📊 Schematic Summary")
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        temp_data = df.groupby('BeaconDescription')['ExternalSensorTemperature'].max()
+                        temp_diffs = abs(temp_data - target_temp)
+                        
+                        with col1:
+                            green_count = len(temp_diffs[temp_diffs <= 5])
+                            st.metric("🟢 Within ±5°C", green_count)
+                        with col2:
+                            yellow_count = len(temp_diffs[(temp_diffs > 5) & (temp_diffs <= 15)])
+                            st.metric("🟡 Within ±15°C", yellow_count)
+                        with col3:
+                            red_count = len(temp_diffs[temp_diffs > 15])
+                            st.metric("🔴 Beyond ±15°C", red_count)
+                        with col4:
+                            total_beacons = len(temp_data)
+                            st.metric("📡 Total Beacons", total_beacons)
+                        
+                        # Add explanation
+                        st.info(f"""
+                        **Temperature Schematic Explanation:**
+                        - 🟢 **Green**: Beacons within ±5°C of target ({target_temp}°C)
+                        - 🟡 **Yellow**: Beacons within ±15°C of target ({target_temp}°C)  
+                        - 🔴 **Red**: Beacons more than ±15°C from target ({target_temp}°C)
+                        - Shows **maximum** temperature reached by each beacon in the selected time range
+                        """)
+                        
+                        plt.close(schematic_fig)  # Free up memory
                 
                 # Show data summary
                 with st.expander("📊 Data Summary"):
